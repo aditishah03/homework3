@@ -1,40 +1,51 @@
 #load_data.py
 import pandas as pd
 from google.cloud import bigtable
+import uuid
 
 client = bigtable.Client(admin=True)
 instance = client.instance("ev-bigtable")
 table = instance.table("ev-population")
 
-# Load and trim dataset
 df = pd.read_csv("Electric_Vehicle_Population_Data.csv")
 df = df[["DOL Vehicle ID", "Make", "Model", "Model Year", "Electric Range", "City", "County"]]
-df = df.dropna(subset=["DOL Vehicle ID"])
-df = df.head(5000)  # Load only first 5,000 rows for testing
 
-print(f"Uploading {len(df)} rows to Bigtable...")
+print(f"Preparing to upload {len(df)} rows to Bigtable...")
+
+used_keys = set()
 
 for i, row_data in df.iterrows():
+    # Handle missing or duplicate row keys
+    raw_id = row_data["DOL Vehicle ID"]
     try:
-        row_key = str(int(row_data["DOL Vehicle ID"])).encode()
-        bt_row = table.direct_row(row_key)
+        row_key = str(int(raw_id)) if not pd.isna(raw_id) else str(uuid.uuid4())
+    except:
+        row_key = str(uuid.uuid4())
 
-        bt_row.set_cell("ev_info", "make", str(row_data["Make"]).encode('utf-8'))
-        bt_row.set_cell("ev_info", "model", str(row_data["Model"]).encode('utf-8'))
-        bt_row.set_cell("ev_info", "model_year", str(row_data["Model Year"]).encode('utf-8'))
-        bt_row.set_cell("ev_info", "electric_range", str(row_data["Electric Range"]).encode('utf-8'))
-        bt_row.set_cell("ev_info", "city", str(row_data["City"]).encode('utf-8'))
-        bt_row.set_cell("ev_info", "county", str(row_data["County"]).encode('utf-8'))
+    # Ensure uniqueness in case of duplicated IDs
+    while row_key in used_keys:
+        row_key = row_key + "_dup"
 
+    used_keys.add(row_key)
+    row_key = row_key.encode()
+
+    bt_row = table.direct_row(row_key)
+
+    try:
+        bt_row.set_cell("ev_info", "make", str(row_data["Make"]).encode("utf-8", errors="ignore"))
+        bt_row.set_cell("ev_info", "model", str(row_data["Model"]).encode("utf-8", errors="ignore"))
+        bt_row.set_cell("ev_info", "model_year", str(row_data["Model Year"]).encode("utf-8", errors="ignore"))
+        bt_row.set_cell("ev_info", "electric_range", str(row_data["Electric Range"]).encode("utf-8", errors="ignore"))
+        bt_row.set_cell("ev_info", "city", str(row_data["City"]).encode("utf-8", errors="ignore"))
+        bt_row.set_cell("ev_info", "county", str(row_data["County"]).encode("utf-8", errors="ignore"))
         bt_row.commit()
-
-        if i % 1000 == 0:
-            print(f"Uploaded {i} rows...")
-
     except Exception as e:
-        print(f"Error inserting row {i}: {e}")
+        print(f"Row {i} failed: {e}")
 
-print(" Data load complte")
+    if i % 1000 == 0:
+        print(f"Uploaded {i} rows...")
+
+print(" All rows uploaded")
 
 #app.py
 from flask import Flask
@@ -46,64 +57,60 @@ instance = client.instance("ev-bigtable")
 table = instance.table("ev-population")
 
 @app.route('/rows')
-def count_rows():
-    rows = table.read_rows()
-    count = sum(1 for _ in rows)
+def rows():
+    count = sum(1 for _ in table.read_rows())
     return str(count)
 
 @app.route('/Best-BMW')
 def best_bmw():
-    rows = table.read_rows()
     count = 0
-    for row in rows:
+    for row in table.read_rows():
         try:
-            make = row.cells['ev_info'].get('make', [])[0].value.decode('utf-8').lower()
-            rng = int(row.cells['ev_info'].get('electric_range', [])[0].value.decode('utf-8'))
-            if make == 'bmw' and rng > 100:
+            make = row.cells['ev_info'][b'make'][0].value.decode().strip().lower()
+            electric_range = float(row.cells['ev_info'][b'electric_range'][0].value.decode().strip())
+            if make == 'bmw' and electric_range > 100:
                 count += 1
-        except:
+        except (KeyError, ValueError, IndexError, TypeError):
             continue
     return str(count)
 
 @app.route('/tesla-owners')
 def tesla_owners():
-    rows = table.read_rows()
     count = 0
-    for row in rows:
+    for row in table.read_rows():
         try:
-            make = row.cells['ev_info'].get('make', [])[0].value.decode('utf-8').lower()
-            city = row.cells['ev_info'].get('city', [])[0].value.decode('utf-8').lower()
+            make = row.cells['ev_info'][b'make'][0].value.decode().strip().lower()
+            city = row.cells['ev_info'][b'city'][0].value.decode().strip().lower()
             if make == 'tesla' and city == 'seattle':
                 count += 1
-        except:
+        except (KeyError, ValueError, IndexError):
             continue
     return str(count)
 
 @app.route('/update')
-def update_range():
+def update():
     row_key = b'257246118'
     bt_row = table.direct_row(row_key)
-    bt_row.set_cell("ev_info", "electric_range", b"200")
+    bt_row.set_cell('ev_info', 'electric_range', b'200')
     bt_row.commit()
     return "Success"
 
 @app.route('/delete')
-def delete_old():
-    rows = table.read_rows()
-    delete_keys = []
-    for row in rows:
+def delete():
+    rows_to_delete = []
+    for row in table.read_rows():
         try:
-            year = int(row.cells['ev_info'].get('model_year', [])[0].value.decode('utf-8'))
+            year = int(row.cells['ev_info'][b'model_year'][0].value.decode().strip())
             if year < 2014:
-                delete_keys.append(row.row_key)
-        except:
+                rows_to_delete.append(row.row_key)
+        except (KeyError, ValueError, IndexError):
             continue
-
-    for key in delete_keys:
-        table.delete_rows(start_key=key, end_key=key + b'\x00')
-
+    for key in rows_to_delete:
+        row = table.direct_row(key)
+        row.delete()
+        row.commit()
     remaining = sum(1 for _ in table.read_rows())
     return str(remaining)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=80)
